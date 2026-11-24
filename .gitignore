@@ -1,0 +1,26 @@
+# Never commit credentials or runtime captures
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+ca/
+data/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
+*.jsonl
+*.pcap
+*.pcapng
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+node_modules/
+.DS_Store

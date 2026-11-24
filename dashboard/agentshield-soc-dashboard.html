@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="az">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AgentShield · SOC Console</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        fontFamily: {
+          display: ['"Space Grotesk"', 'sans-serif'],
+          body: ['Inter', 'sans-serif'],
+          mono: ['"JetBrains Mono"', 'monospace'],
+        },
+        colors: {
+          midnight: '#0B0F17',
+          panel: '#131A26',
+          panel2: '#0F1620',
+          hairline: '#1F2A3A',
+          ink: '#E6EDF5',
+          muted: '#7C8BA0',
+          safe: '#34D5C4',
+          warn: '#F2B441',
+          block: '#FF5C7A',
+          redact: '#B57CFF',
+          signal: '#6E8BFF',
+        },
+      },
+    },
+  };
+</script>
+<style>
+  html, body { background: #0B0F17; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #1F2A3A; border-radius: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  @keyframes streamIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+  .stream-in { animation: streamIn .35s ease-out; }
+  @keyframes pulseDot { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .live-dot { animation: pulseDot 1.4s ease-in-out infinite; }
+  @keyframes sweep { 0% { transform: translateX(-100%); } 100% { transform: translateX(300%); } }
+  .sweep::after { content:''; position:absolute; inset:0; width:33%; background:linear-gradient(90deg,transparent,rgba(110,139,255,.14),transparent); animation: sweep 2.6s linear infinite; }
+  @media (prefers-reduced-motion: reduce) {
+    .stream-in, .live-dot, .sweep::after { animation: none !important; }
+  }
+</style>
+</head>
+<body class="font-body text-ink">
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ---------------------------------------------------------------------------
+// Domain model — mirrors the Faza 1 backend audit schema:
+//   { ts, request_id, event:'completed'|'blocked', mode, provider,
+//     input_detections:[type], injection_score, injection_verdict,
+//     detokenized, canary_leak, output_redactions:[type], latency_ms,
+//     reason?, details? }
+// A real deployment enriches each event with SSO identity (dept/user);
+// Demo mode synthesizes that layer so the heatmap has something to bucket by.
+// ---------------------------------------------------------------------------
+const DEMO_DEPARTMENTS = ["Mühəndislik", "Maliyyə", "HR", "Hüquq", "Satış", "Dəstək"];
+const DEPARTMENTS = [...DEMO_DEPARTMENTS, "Unassigned"];
+const USERS = {
+  "Unassigned": ["unknown"],
+  "Mühəndislik": ["r.aliyev", "s.mamedov", "k.huseyn"],
+  "Maliyyə": ["n.qasimova", "e.rzayev"],
+  "HR": ["l.abbas", "m.tagiyeva"],
+  "Hüquq": ["v.kerimli"],
+  "Satış": ["a.suleyman", "t.orujova", "f.hasanli"],
+  "Dəstək": ["d.ismayil", "z.novruz"],
+};
+const PII_TYPES = ["EMAIL", "PHONE", "CARD", "IBAN", "FIN", "API_KEY", "JWT", "PRIVATE_KEY", "SECRET"];
+const RISK_ROWS = ["Injection", "API_KEY", "PII", "Kart/IBAN", "Prompt Leak"];
+const PROVIDERS = ["openai", "anthropic", "mock"];
+const INJECTION_RULES = [
+  { id: "override_instructions", w: 0.6, d: "Əvvəlki təlimatları ləğv etmə" },
+  { id: "prompt_leak", w: 0.6, d: "System prompt sızdırma" },
+  { id: "jailbreak_persona", w: 0.55, d: "Jailbreak persona (DAN, dev mode)" },
+  { id: "disable_safety", w: 0.55, d: "Təhlükəsizliyi söndürmə cəhdi" },
+  { id: "tag_smuggling", w: 0.5, d: "Chat-format tag smuggling" },
+  { id: "exfil_instruction", w: 0.7, d: "Data eksfiltrasiya təlimatı" },
+  { id: "obfuscation_base64", w: 0.2, d: "Base64 obfuskasiyası" },
+];
+
+const uid = () => "ags-" + Math.random().toString(16).slice(2, 14);
+const pick = (a) => a[Math.floor(Math.random() * a.length)];
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+// Weighted synthetic event generator. ~14% blocked, matching a plausible
+// enterprise mix where most traffic is clean and a minority trips policy.
+function makeEvent() {
+  const dept = pick(DEMO_DEPARTMENTS);
+  const user = pick(USERS[dept]);
+  const provider = pick(PROVIDERS);
+  const roll = Math.random();
+  const base = {
+    ts: Date.now() / 1000,
+    request_id: uid(),
+    mode: "redact",
+    provider,
+    dept,
+    user,
+    canary_leak: false,
+    output_redactions: [],
+    latency_ms: +(8 + Math.random() * 90).toFixed(1),
+  };
+
+  if (roll < 0.09) {
+    // Prompt injection → blocked (LLM01)
+    const n = 1 + Math.floor(Math.random() * 2);
+    const rules = [...INJECTION_RULES].sort(() => Math.random() - 0.5).slice(0, n + 1);
+    const score = clamp(rules.reduce((s, r) => s + r.w, 0), 0, 1);
+    return { ...base, event: "blocked", reason: "prompt_injection_detected",
+      input_detections: [], injection_score: +score.toFixed(2), injection_verdict: "block",
+      detokenized: 0, latency_ms: +(0.2 + Math.random() * 2).toFixed(1),
+      details: { owasp: "LLM01", score: +score.toFixed(2), matched_rules: rules } };
+  }
+  if (roll < 0.14) {
+    // Sensitive data in block-mode → blocked (LLM06)
+    const dets = [...PII_TYPES].sort(() => Math.random() - 0.5).slice(0, 1 + Math.floor(Math.random() * 2));
+    return { ...base, event: "blocked", reason: "sensitive_data_detected", mode: "block",
+      input_detections: dets, injection_score: 0, injection_verdict: "allow",
+      detokenized: 0, latency_ms: +(0.1 + Math.random()).toFixed(1),
+      details: { owasp: "LLM06", detections: dets.map((t) => ({ type: t })) } };
+  }
+  // Completed — some with redactions, some clean
+  const hasPII = Math.random() < 0.42;
+  const dets = hasPII ? [...PII_TYPES].sort(() => Math.random() - 0.5).slice(0, 1 + Math.floor(Math.random() * 3)) : [];
+  const warnInj = Math.random() < 0.12;
+  const outLeak = Math.random() < 0.05;
+  return { ...base, event: "completed",
+    input_detections: dets,
+    injection_score: warnInj ? +(0.35 + Math.random() * 0.3).toFixed(2) : +(Math.random() * 0.2).toFixed(2),
+    injection_verdict: warnInj ? "warn" : "allow",
+    detokenized: dets.length,
+    canary_leak: outLeak,
+    output_redactions: outLeak ? ["API_KEY"] : [] };
+}
+
+// Map a raw event to the heatmap risk rows it contributes to.
+function riskRowsFor(ev) {
+  const rows = [];
+  if (ev.injection_verdict === "block" || ev.injection_verdict === "warn") rows.push("Injection");
+  const dets = [...(ev.input_detections || []), ...(ev.output_redactions || [])];
+  if (dets.some((t) => t === "API_KEY" || t === "JWT" || t === "PRIVATE_KEY" || t === "SECRET")) rows.push("API_KEY");
+  if (dets.some((t) => t === "EMAIL" || t === "PHONE" || t === "FIN")) rows.push("PII");
+  if (dets.some((t) => t === "CARD" || t === "IBAN")) rows.push("Kart/IBAN");
+  if (ev.canary_leak) rows.push("Prompt Leak");
+  return rows;
+}
+
+// --- tiny UI atoms ----------------------------------------------------------
+const verdictMeta = {
+  block: { label: "BLOK", cls: "text-block", chip: "bg-block/12 text-block border-block/30" },
+  warn: { label: "XƏBƏRDARLIQ", cls: "text-warn", chip: "bg-warn/12 text-warn border-warn/30" },
+  allow: { label: "İCAZƏ", cls: "text-safe", chip: "bg-safe/10 text-safe border-safe/25" },
+};
+
+function Chip({ children, className = "" }) {
+  return <span className={"inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-mono font-medium border " + className}>{children}</span>;
+}
+
+function KpiCard({ label, value, sub, tone = "ink", trail }) {
+  const toneCls = { ink: "text-ink", block: "text-block", warn: "text-warn", safe: "text-safe", redact: "text-redact", signal: "text-signal" }[tone];
+  return (
+    <div className="relative overflow-hidden rounded-xl border border-hairline bg-panel px-4 py-3.5">
+      <div className="text-[11px] uppercase tracking-[0.14em] text-muted font-mono">{label}</div>
+      <div className={"mt-1.5 font-display text-3xl font-600 tabular-nums " + toneCls}>{value}</div>
+      <div className="mt-0.5 text-[11px] text-muted">{sub}</div>
+      {trail && <div className="absolute right-3 top-3 h-8 flex items-end gap-[2px]">
+        {trail.map((h, i) => <span key={i} style={{ height: `${8 + h * 24}px` }} className="w-[3px] rounded-sm bg-signal/30" />)}
+      </div>}
+    </div>
+  );
+}
+
+// --- Risk heatmap (signature element) --------------------------------------
+function Heatmap({ matrix, max }) {
+  const cell = (v) => {
+    const t = max ? v / max : 0;
+    if (v === 0) return "bg-hairline/40";
+    if (t < 0.25) return "bg-signal/25";
+    if (t < 0.5) return "bg-warn/40";
+    if (t < 0.75) return "bg-block/50";
+    return "bg-block/80";
+  };
+  return (
+    <div className="overflow-x-auto">
+      <div className="min-w-[560px]">
+        <div className="grid" style={{ gridTemplateColumns: `120px repeat(${DEPARTMENTS.length}, 1fr)` }}>
+          <div />
+          {DEPARTMENTS.map((d) => (
+            <div key={d} className="px-1 pb-2 text-center text-[10px] font-mono text-muted truncate" title={d}>{d}</div>
+          ))}
+          {RISK_ROWS.map((r) => (
+            <React.Fragment key={r}>
+              <div className="flex items-center pr-3 text-[11px] font-mono text-muted">{r}</div>
+              {DEPARTMENTS.map((d) => {
+                const v = matrix[r]?.[d] || 0;
+                return (
+                  <div key={d + r} className="p-[3px]">
+                    <div className={"group relative aspect-[2/1] rounded-md transition-colors " + cell(v)}>
+                      <span className="absolute inset-0 flex items-center justify-center text-[11px] font-mono font-600 text-ink/90 tabular-nums">
+                        {v || ""}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- OWASP coverage rail ----------------------------------------------------
+function OwaspRail({ counts }) {
+  const items = [
+    { id: "LLM01", name: "Prompt Injection", key: "LLM01", tone: "block" },
+    { id: "LLM02", name: "Insecure Output", key: "LLM02", tone: "warn" },
+    { id: "LLM06", name: "Sensitive Info Disclosure", key: "LLM06", tone: "redact" },
+  ];
+  return (
+    <div className="space-y-2">
+      {items.map((it) => (
+        <div key={it.id} className="flex items-center justify-between rounded-lg border border-hairline bg-panel2 px-3 py-2">
+          <div className="flex items-center gap-2.5">
+            <span className={`h-1.5 w-1.5 rounded-full bg-${it.tone}`} />
+            <span className="font-mono text-xs text-ink">{it.id}</span>
+            <span className="text-[11px] text-muted">{it.name}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-xs tabular-nums text-muted">{counts[it.key] || 0}</span>
+            <span className="rounded bg-safe/10 px-1.5 py-0.5 text-[9px] font-mono text-safe border border-safe/20">AKTİV</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// --- Blocked drill-down row -------------------------------------------------
+function BlockedRow({ ev }) {
+  const [open, setOpen] = useState(false);
+  const isInj = ev.reason === "prompt_injection_detected";
+  return (
+    <div className="stream-in rounded-lg border border-hairline bg-panel2">
+      <button onClick={() => setOpen(!open)} className="flex w-full items-center gap-3 px-3 py-2.5 text-left">
+        <span className={"h-1.5 w-1.5 shrink-0 rounded-full " + (isInj ? "bg-block" : "bg-redact")} />
+        <span className="font-mono text-[11px] text-muted w-[92px] shrink-0">{ev.request_id.slice(0, 12)}</span>
+        <span className="text-xs text-ink w-[110px] shrink-0 truncate">{ev.dept}</span>
+        <span className="font-mono text-[11px] text-muted w-[96px] shrink-0 truncate">{ev.user}</span>
+        <span className="flex-1 text-[11px] text-muted truncate">
+          {isInj ? `Injection · skor ${ev.details?.score ?? ev.injection_score}` : `Həssas data · ${(ev.input_detections || []).join(", ")}`}
+        </span>
+        <Chip className={isInj ? verdictMeta.block.chip : "bg-redact/12 text-redact border-redact/30"}>{ev.details?.owasp}</Chip>
+        <span className="ml-1 text-muted text-xs">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <div className="border-t border-hairline px-3 py-2.5 text-[11px]">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-muted">
+            <div>reason: <span className="text-ink">{ev.reason}</span></div>
+            <div>mode: <span className="text-ink">{ev.mode}</span></div>
+            <div>owasp: <span className="text-ink">{ev.details?.owasp}</span></div>
+            <div>latency: <span className="text-ink">{ev.latency_ms}ms</span></div>
+          </div>
+          {isInj && ev.details?.matched_rules && (
+            <div className="mt-2">
+              <div className="text-[10px] uppercase tracking-wider text-muted mb-1">Uyğun gələn qaydalar</div>
+              <div className="flex flex-wrap gap-1.5">
+                {ev.details.matched_rules.map((r, i) => (
+                  <Chip key={i} className="bg-block/10 text-block border-block/25" title={r.d}>{r.id} · {r.w}</Chip>
+                ))}
+              </div>
+            </div>
+          )}
+          {!isInj && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {(ev.details?.detections || []).map((d, i) => (
+                <Chip key={i} className="bg-redact/10 text-redact border-redact/25">{d.type}</Chip>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --- Live event feed row ----------------------------------------------------
+function FeedRow({ ev }) {
+  const vm = verdictMeta[ev.injection_verdict] || verdictMeta.allow;
+  const blocked = ev.event === "blocked";
+  const time = new Date(ev.ts * 1000).toLocaleTimeString("az", { hour12: false });
+  const tags = ev.input_detections || [];
+  return (
+    <div className="stream-in flex items-center gap-2.5 border-b border-hairline/60 px-3 py-2 hover:bg-hairline/20">
+      <span className="font-mono text-[10px] text-muted w-[62px] shrink-0">{time}</span>
+      <span className={"h-1.5 w-1.5 shrink-0 rounded-full " + (blocked ? "bg-block" : ev.injection_verdict === "warn" ? "bg-warn" : "bg-safe")} />
+      <span className="text-[11px] text-ink w-[104px] shrink-0 truncate">{ev.dept}</span>
+      <span className="font-mono text-[10px] text-muted w-[52px] shrink-0">{ev.provider}</span>
+      <span className="flex-1 min-w-0 flex flex-wrap gap-1">
+        {blocked && <Chip className={vm.chip}>{blocked && ev.reason === "prompt_injection_detected" ? "INJECTION" : "BLOK"}</Chip>}
+        {tags.slice(0, 3).map((t) => (
+          <Chip key={t} className="bg-redact/10 text-redact border-redact/25">{t}</Chip>
+        ))}
+        {ev.detokenized > 0 && <Chip className="bg-signal/10 text-signal border-signal/25">↺{ev.detokenized}</Chip>}
+        {ev.canary_leak && <Chip className="bg-block/12 text-block border-block/30">LEAK</Chip>}
+      </span>
+      <span className="font-mono text-[10px] text-muted w-[54px] shrink-0 text-right tabular-nums">{ev.latency_ms}ms</span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+function App() {
+  const [events, setEvents] = useState([]);           // newest first, capped
+  const [running, setRunning] = useState(true);
+  const [source, setSource] = useState("demo");        // 'demo' | 'live'
+  const [gwUrl, setGwUrl] = useState(location.protocol.startsWith("http") ? location.origin : "http://127.0.0.1:8000");
+  const [conn, setConn] = useState("demo");            // demo | connecting | online | offline
+  const [now, setNow] = useState(Date.now());
+  const seen = useRef(new Set());
+
+  const push = useCallback((batch) => {
+    setEvents((prev) => {
+      const fresh = batch.filter((e) => !seen.current.has(e.request_id));
+      fresh.forEach((e) => seen.current.add(e.request_id));
+      if (!fresh.length) return prev;
+      return [...fresh.reverse(), ...prev].slice(0, 400);
+    });
+  }, []);
+
+  // clock
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
+
+  // Demo stream — bursts of 1–2 events on a jittered interval
+  useEffect(() => {
+    if (source !== "demo" || !running) return;
+    setConn("demo");
+    let alive = true;
+    const tick = () => {
+      if (!alive) return;
+      const n = 1 + Math.floor(Math.random() * 2);
+      push(Array.from({ length: n }, makeEvent));
+      timer = setTimeout(tick, 700 + Math.random() * 1100);
+    };
+    let timer = setTimeout(tick, 400);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [source, running, push]);
+
+  // Live mode — poll the real Faza 1 backend /admin/events
+  useEffect(() => {
+    if (source !== "live" || !running) return;
+    let alive = true;
+    setConn("connecting");
+    const poll = async () => {
+      try {
+        const r = await fetch(gwUrl.replace(/\/$/, "") + "/admin/events?limit=100");
+        if (!r.ok) throw new Error(r.status);
+        const data = await r.json();
+        if (!alive) return;
+        setConn("online");
+        // Do not fabricate employee identity or departments for real events.
+        const enriched = (data.events || []).map((e) => ({
+          ...e,
+          dept: DEPARTMENTS.includes(e.dept) ? e.dept : "Unassigned",
+          user: e.user || "unknown",
+        }));
+        push(enriched);
+      } catch (err) {
+        if (alive) setConn("offline");
+      }
+    };
+    poll();
+    const t = setInterval(poll, 2000);
+    return () => { alive = false; clearInterval(t); };
+  }, [source, running, gwUrl, push]);
+
+  // Derived metrics
+  const stats = useMemo(() => {
+    let blocked = 0, redactions = 0, injBlocked = 0, injWarn = 0, latSum = 0, latN = 0, leaks = 0;
+    const owasp = {};
+    const matrix = {};
+    RISK_ROWS.forEach((r) => { matrix[r] = {}; DEPARTMENTS.forEach((d) => (matrix[r][d] = 0)); });
+    events.forEach((e) => {
+      if (e.event === "blocked") { blocked++; if (e.reason === "prompt_injection_detected") injBlocked++; owasp[e.details?.owasp] = (owasp[e.details?.owasp] || 0) + 1; }
+      if (e.injection_verdict === "warn") { injWarn++; owasp["LLM01"] = (owasp["LLM01"] || 0) + 1; }
+      redactions += (e.input_detections || []).length;
+      if (e.output_redactions?.length) owasp["LLM02"] = (owasp["LLM02"] || 0) + e.output_redactions.length;
+      if ((e.input_detections || []).length) owasp["LLM06"] = (owasp["LLM06"] || 0) + 1;
+      if (e.canary_leak) leaks++;
+      if (typeof e.latency_ms === "number") { latSum += e.latency_ms; latN++; }
+      riskRowsFor(e).forEach((row) => { if (matrix[row]) matrix[row][e.dept] = (matrix[row][e.dept] || 0) + 1; });
+    });
+    let maxCell = 0;
+    Object.values(matrix).forEach((r) => Object.values(r).forEach((v) => (maxCell = Math.max(maxCell, v))));
+    return {
+      total: events.length, blocked, redactions, injBlocked, injWarn, leaks,
+      avgLat: latN ? (latSum / latN).toFixed(1) : "0.0",
+      owasp, matrix, maxCell,
+      blockRate: events.length ? ((blocked / events.length) * 100).toFixed(1) : "0.0",
+    };
+  }, [events]);
+
+  const blockedEvents = useMemo(() => events.filter((e) => e.event === "blocked").slice(0, 20), [events]);
+  const trail = useMemo(() => Array.from({ length: 7 }, () => Math.random()), [stats.total > 0 && Math.floor(stats.total / 5)]);
+
+  const connMeta = {
+    demo: { label: "DEMO STREAM", dot: "bg-signal", text: "text-signal" },
+    connecting: { label: "QOŞULUR…", dot: "bg-warn", text: "text-warn" },
+    online: { label: "CANLI · GATEWAY", dot: "bg-safe", text: "text-safe" },
+    offline: { label: "GATEWAY OFFLINE", dot: "bg-block", text: "text-block" },
+  }[conn];
+
+  return (
+    <div className="min-h-screen bg-midnight">
+      {/* Top bar */}
+      <header className="sticky top-0 z-20 border-b border-hairline bg-midnight/90 backdrop-blur">
+        <div className="mx-auto flex max-w-[1400px] flex-wrap items-center gap-x-6 gap-y-3 px-5 py-3">
+          <div className="flex items-center gap-3">
+            <div className="grid h-8 w-8 place-items-center rounded-lg border border-signal/40 bg-signal/10">
+              <span className="text-signal text-sm">🛡</span>
+            </div>
+            <div>
+              <div className="font-display text-[15px] font-600 leading-none tracking-tight">AgentShield</div>
+              <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-muted mt-0.5">SOC Console · Faza 2</div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 rounded-lg border border-hairline bg-panel px-2.5 py-1.5">
+            <span className={"h-2 w-2 rounded-full live-dot " + connMeta.dot} />
+            <span className={"font-mono text-[10px] font-500 " + connMeta.text}>{connMeta.label}</span>
+          </div>
+
+          <div className="ml-auto flex items-center gap-2">
+            {/* Source toggle */}
+            <div className="flex rounded-lg border border-hairline bg-panel p-0.5 text-[11px] font-mono">
+              {["demo", "live"].map((s) => (
+                <button key={s} onClick={() => setSource(s)}
+                  className={"rounded-md px-2.5 py-1 transition-colors " + (source === s ? "bg-signal/20 text-signal" : "text-muted hover:text-ink")}>
+                  {s === "demo" ? "Demo" : "Canlı"}
+                </button>
+              ))}
+            </div>
+            {source === "live" && (
+              <input value={gwUrl} onChange={(e) => setGwUrl(e.target.value)}
+                className="w-[190px] rounded-lg border border-hairline bg-panel px-2.5 py-1.5 font-mono text-[11px] text-ink outline-none focus:border-signal/50"
+                placeholder="http://127.0.0.1:8000" />
+            )}
+            <button onClick={() => setRunning((r) => !r)}
+              className={"rounded-lg border px-3 py-1.5 font-mono text-[11px] transition-colors " + (running ? "border-warn/40 bg-warn/10 text-warn" : "border-safe/40 bg-safe/10 text-safe")}>
+              {running ? "⏸ Dayandır" : "▶ Davam et"}
+            </button>
+            <div className="hidden sm:block font-mono text-[11px] tabular-nums text-muted">
+              {new Date(now).toLocaleTimeString("az", { hour12: false })}
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-[1400px] px-5 py-5">
+        {/* KPI row */}
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          <KpiCard label="Sorğular" value={stats.total} sub="emal edildi" tone="ink" trail={trail} />
+          <KpiCard label="Bloklandı" value={stats.blocked} sub={`${stats.blockRate}% blok nisbəti`} tone="block" />
+          <KpiCard label="Maskalanan PII" value={stats.redactions} sub="vault-a yönləndi" tone="redact" />
+          <KpiCard label="Injection" value={stats.injBlocked} sub={`+${stats.injWarn} xəbərdarlıq`} tone="warn" />
+          <KpiCard label="Orta gecikmə" value={stats.avgLat + "ms"} sub="gateway overhead" tone="safe" />
+          <KpiCard label="Prompt Leak" value={stats.leaks} sub="canary aşkarladı" tone="signal" />
+        </div>
+
+        {/* Body grid */}
+        <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-12">
+          {/* Live feed */}
+          <section className="lg:col-span-7 rounded-xl border border-hairline bg-panel overflow-hidden">
+            <div className="flex items-center justify-between border-b border-hairline px-4 py-3">
+              <h2 className="font-display text-sm font-600 tracking-tight">Real-time hadisə lenti</h2>
+              <span className="font-mono text-[10px] text-muted">{events.length} hadisə · axının başı ↑</span>
+            </div>
+            <div className="relative h-[440px] overflow-y-auto">
+              {events.length === 0 && (
+                <div className="grid h-full place-items-center text-center">
+                  <div>
+                    <div className="text-muted text-sm">Axın gözlənilir…</div>
+                    <div className="mt-1 text-[11px] text-muted/70">Demo rejim avtomatik hadisə yaradır; Canlı rejim gateway-ə qoşulur.</div>
+                  </div>
+                </div>
+              )}
+              {events.map((e) => <FeedRow key={e.request_id} ev={e} />)}
+            </div>
+            {running && events.length > 0 && (
+              <div className="relative h-0.5 overflow-hidden bg-hairline sweep" />
+            )}
+          </section>
+
+          {/* Right column */}
+          <div className="lg:col-span-5 space-y-4">
+            <section className="rounded-xl border border-hairline bg-panel p-4">
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="font-display text-sm font-600 tracking-tight">Risk heatmap</h2>
+                <span className="font-mono text-[10px] text-muted">şöbə × risk tipi</span>
+              </div>
+              <Heatmap matrix={stats.matrix} max={stats.maxCell} />
+              <div className="mt-3 flex items-center gap-3 text-[10px] font-mono text-muted">
+                <span className="flex items-center gap-1"><span className="h-2 w-3 rounded-sm bg-hairline/40" />yox</span>
+                <span className="flex items-center gap-1"><span className="h-2 w-3 rounded-sm bg-signal/25" />aşağı</span>
+                <span className="flex items-center gap-1"><span className="h-2 w-3 rounded-sm bg-warn/40" />orta</span>
+                <span className="flex items-center gap-1"><span className="h-2 w-3 rounded-sm bg-block/80" />yüksək</span>
+              </div>
+            </section>
+
+            <section className="rounded-xl border border-hairline bg-panel p-4">
+              <h2 className="font-display text-sm font-600 tracking-tight mb-3">OWASP LLM Top 10 · örtük</h2>
+              <OwaspRail counts={stats.owasp} />
+            </section>
+          </div>
+        </div>
+
+        {/* Blocked drill-down */}
+        <section className="mt-4 rounded-xl border border-hairline bg-panel overflow-hidden">
+          <div className="flex items-center justify-between border-b border-hairline px-4 py-3">
+            <h2 className="font-display text-sm font-600 tracking-tight">Bloklanmış sorğular · drill-down</h2>
+            <span className="font-mono text-[10px] text-muted">son {blockedEvents.length}</span>
+          </div>
+          <div className="p-3 space-y-2 max-h-[360px] overflow-y-auto">
+            {blockedEvents.length === 0 && (
+              <div className="py-8 text-center text-[11px] text-muted">Hələ bloklanmış sorğu yoxdur — bütün trafik siyasətdən keçir.</div>
+            )}
+            {blockedEvents.map((e) => <BlockedRow key={e.request_id} ev={e} />)}
+          </div>
+        </section>
+
+        <footer className="mt-6 flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-4 text-[10px] font-mono text-muted">
+          <span>AgentShield SOC Console · prototype · demo telemetry is synthetic</span>
+          <span>OWASP LLM01 · LLM02 · LLM06 örtüyü aktiv · Faza 1 backend-ə qoşulur</span>
+        </footer>
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

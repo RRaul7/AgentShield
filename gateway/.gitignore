@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.agentshield_vault.key
+agentshield_vault.db
+agentshield_audit.jsonl
+server.log
+client_out.txt
+nohup.out
